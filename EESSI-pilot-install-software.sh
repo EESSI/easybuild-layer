@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Script to install EESSI pilot software stack (version 2021.03)
 #
@@ -62,6 +62,9 @@ export EPREFIX=${EESSI_PREFIX}/compat/${EESSI_OS_TYPE}/${EESSI_CPU_FAMILY}
 DETECTION_PARAMETERS=''
 GENERIC=0
 EB='eb'
+if [ -z "$EB_MODULE_NAME" ]; then EB_MODULE_NAME='EasyBuild'; fi
+REQ_EB_VERSION='4.3.4'
+
 if [[ "$1" == "--generic" || "$EASYBUILD_OPTARCH" == "GENERIC" ]]; then
     echo_yellow ">> GENERIC build requested, taking appropriate measures!"
     DETECTION_PARAMETERS="$DETECTION_PARAMETERS --generic"
@@ -69,9 +72,8 @@ if [[ "$1" == "--generic" || "$EASYBUILD_OPTARCH" == "GENERIC" ]]; then
     EB='eb --optarch=GENERIC'
 fi
 
-
-# make sure we're in Prefix environment by which path to 'bash' command
-if [[ $(which bash) = ${EPREFIX}/bin/bash ]]; then
+# make sure we're in Prefix environment by checking which 'bash' our $SHELL is using
+if [[ ${SHELL} = ${EPREFIX}/bin/bash ]]; then
     echo_green ">> It looks like we're in a Gentoo Prefix environment, good!"
 else
     error "Not running in Gentoo Prefix environment, run '${EPREFIX}/startprefix' first!"
@@ -130,7 +132,6 @@ fi
 
 export EASYBUILD_FILTER_DEPS=$DEPS_TO_FILTER
 
-
 export EASYBUILD_MODULE_EXTENSIONS=1
 
 echo ">> Setting up \$MODULEPATH..."
@@ -138,20 +139,34 @@ echo ">> Setting up \$MODULEPATH..."
 module --force purge
 # ignore current $MODULEPATH entirely
 module unuse $MODULEPATH
-module use $EASYBUILD_INSTALLPATH/modules/all
+if [[ -z "$EESSI_REBUILD_PATH" ]]; then
+    # Default behaviour is to do a full build
+    module use $EASYBUILD_INSTALLPATH/modules/all
+else
+    # If EESSI_REBUILD_PATH is set, we assume software is built and we are just rebuilding the module tree
+    export EASYBUILD_INSTALLPATH_MODULES=$EESSI_REBUILD_PATH/modules
+    [[ -z "$EESSI_REBUILD_MODULEPATH" ]] && module use $EESSI_REBUILD_PATH/modules/all || module use $EESSI_REBUILD_MODULEPATH
+    # Use preferred MNS
+    [[ -z "$EESSI_REBUILD_MNS" ]] && export EASYBUILD_MODULE_NAMING_SCHEME=EasyBuildMNS || export EASYBUILD_MODULE_NAMING_SCHEME=$EESSI_REBUILD_MNS
+    # Only rebuild modules
+    export EASYBUILD_MODULE_ONLY=1
+    # Make sure we can write our lock files
+    export EASYBUILD_LOCKS_DIR=$EESSI_REBUILD_PATH/software
+fi
+
 if [[ -z ${MODULEPATH} ]]; then
     error "Failed to set up \$MODULEPATH?!"
 else
     echo_green ">> MODULEPATH set up: ${MODULEPATH}"
 fi
 
-echo ">> Checking for EasyBuild module..."
-ml_av_easybuild_out=$TMPDIR/ml_av_easybuild.out
-module avail easybuild &> ${ml_av_easybuild_out}
+echo ">> Checking for ${EB_MODULE_NAME} module (required version is ${REQ_EB_VERSION})..."
+ml_show_easybuild_out=$TMPDIR/ml_show_easybuild.out
+module show ${EB_MODULE_NAME}/${REQ_EB_VERSION} &> ${ml_show_easybuild_out}
 if [[ $? -eq 0 ]]; then
-    echo_green ">> EasyBuild module found!"
+    echo_green ">> ${EB_MODULE_NAME}/${REQ_EB_VERSION} module found!"
 else
-    echo_yellow ">> No EasyBuild module yet, installing it..."
+    echo_yellow ">> No ${EB_MODULE_NAME}/${REQ_EB_VERSION} module yet, installing it..."
 
     EB_TMPDIR=${TMPDIR}/ebtmp
     echo ">> Temporary installation (in ${EB_TMPDIR})..."
@@ -162,19 +177,26 @@ else
     export PATH=${EB_TMPDIR}/bin:$PATH
     export PYTHONPATH=$(ls -d ${EB_TMPDIR}/lib/python*/site-packages):$PYTHONPATH
     eb_install_out=${TMPDIR}/eb_install.out
-    eb --install-latest-eb-release &> ${eb_install_out}
-
-    module avail easybuild &> ${ml_av_easybuild_out}
+    # Check whether we have an easyconfig for our required version (from last line of output)
+    eb --search EasyBuild-${REQ_EB_VERSION}.eb |& tail -1 | grep ${REQ_EB_VERSION} > /dev/null
     if [[ $? -eq 0 ]]; then
-        echo_green ">> EasyBuild module installed!"
+        eb EasyBuild-${REQ_EB_VERSION}.eb &> ${eb_install_out}
     else
-        error "EasyBuild module failed to install?! (output of 'pip install' in ${pip_install_out}, output of 'eb' in ${eb_install_out}, output of 'ml av easybuild' in ${ml_av_easybuild_out})"
+        # If we don't have an easyconfig in the repo then it can only be the latest release
+        eb --install-latest-eb-release &> ${eb_install_out}
+    fi
+
+    module show ${EB_MODULE_NAME}/${REQ_EB_VERSION} &> ${ml_show_easybuild_out}
+    if [[ $? -eq 0 ]]; then
+        echo_green ">> ${EB_MODULE_NAME} module installed!"
+    else
+        error "${EB_MODULE_NAME} module failed to install?! (output of 'pip install' in ${pip_install_out}, output of 'eb' in ${eb_install_out}, output of 'module show ${EB_MODULE_NAME}/${REQ_EB_VERSION}' in ${ml_show_easybuild_out})"
     fi
 fi
 
-REQ_EB_VERSION='4.3.4'
-echo ">> Loading EasyBuild module..."
-module load EasyBuild
+echo ">> Loading ${EB_MODULE_NAME} module..."
+module load ${EB_MODULE_NAME}/${REQ_EB_VERSION}
+
 eb_show_system_info_out=${TMPDIR}/eb_show_system_info.out
 $EB --show-system-info > ${eb_show_system_info_out}
 if [[ $? -eq 0 ]]; then
@@ -271,7 +293,10 @@ check_exit_code $? "${ok_msg}" "${fail_msg}"
 echo ">> Installing OpenFOAM (twice!)..."
 ok_msg="OpenFOAM installed, now we're talking!"
 fail_msg="Installation of OpenFOAM failed, we were so close..."
+# May not have enough cores for the sanity check (6 required)
+export OMPI_MCA_rmaps_base_oversubscribe=1
 $EB OpenFOAM-8-foss-2020a.eb OpenFOAM-v2006-foss-2020a.eb --robot
+unset OMPI_MCA_rmaps_base_oversubscribe
 check_exit_code $? "${ok_msg}" "${fail_msg}"
 
 echo ">> Installing QuantumESPRESSO..."
